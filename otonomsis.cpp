@@ -1,113 +1,148 @@
-#include <cmath>
-#include <memory>
-#include <string>
-#include <functional>
-#include <chrono>
-#include <vector>
-
 #include <rclcpp/rclcpp.hpp>
-
-#include <mav_msgs/msg/actuators.hpp>
 #include <nav_msgs/msg/odometry.hpp>
-#include <trajectory_msgs/msg/multi_dof_joint_trajectory_point.hpp>
-
+#include <mav_msgs/msg/actuators.hpp>
 #include <Eigen/Dense>
 #include <tf2/utils.h>
+#include <cmath>
 
-#define PI M_PI
-using namespace std::chrono_literals;
-
-class ControllerNode : public rclcpp::Node {
+class GeoHoverController : public rclcpp::Node {
 public:
-  ControllerNode()
-  : rclcpp::Node("controller_node"),
-    e3(0,0,1),
-    F2W(4,4),
-    hz(200.0)
-  {
+  GeoHoverController() : Node("geo_hover_controller") {
+    // Subscribers and publisher
+    odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
+      "current_state", 10,
+      std::bind(&GeoHoverController::odomCallback, this, std::placeholders::_1));
+
+    motor_pub_ = this->create_publisher<mav_msgs::msg::Actuators>(
+      "rotor_speed_cmds", 10);
+
+    timer_ = this->create_wall_timer(
+      std::chrono::milliseconds(10),
+      std::bind(&GeoHoverController::controlLoop, this));
+
     // === Parameters ===
-    this->declare_parameter<double>("radius", 3.0);
-    this->declare_parameter<double>("altitude", 3.0);
-    this->declare_parameter<double>("omega", 0.6);
-    this->declare_parameter<double>("hz", hz);
+    m_ = 1.0;
+    g_ = 9.81;
+    cf_ = 1e-3;
+    cd_ = 1e-5;
+    d_ = 0.3;
 
-    this->declare_parameter<double>("kx", 4.0);
-    this->declare_parameter<double>("kv", 2.5);
-    this->declare_parameter<double>("kr", 1.0);
-    this->declare_parameter<double>("komega", 0.2);
+    // === Controller gains ===
+    kx_ = 6.0;
+    kv_ = 3.0;
+    kr_ = 1.5;
+    komega_ = 0.15;
 
-    this->get_parameter("radius", circle_radius);
-    this->get_parameter("altitude", circle_altitude);
-    this->get_parameter("omega", circle_omega);
-    this->get_parameter("hz", hz);
-    this->get_parameter("kx", kx);
-    this->get_parameter("kv", kv);
-    this->get_parameter("kr", kr);
-    this->get_parameter("komega", komega);
+    // === Desired hover state ===
+    xd_ << 0.0, 0.0, 30.0; // 30 metre yükseklik
+    vd_.setZero();
+    ad_.setZero();
+    yawd_ = 0.0;
 
-    // === Physical constants ===
-    m = 1.0;
-    cd = 1e-5;
-    cf = 1e-3;
-    g = 9.81;
-    d = 0.3;
-    J << 1.0,0.0,0.0,
-         0.0,1.0,0.0,
-         0.0,0.0,1.0;
+    e3_ << 0, 0, 1;
 
-    x.setZero(); v.setZero(); R.setIdentity(); omega.setZero();
-    xd.setZero(); vd.setZero(); ad.setZero(); yawd = 0.0;
-
-    // === F2W matrix (example, adjust if needed) ===
-    double ct = cd / cf;
-    F2W.setZero();
-    F2W(0,0)=cf; F2W(0,1)=cf; F2W(0,2)=cf; F2W(0,3)=cf;
-    F2W(1,0)= d*cf; F2W(1,1)=-d*cf; F2W(1,2)=-d*cf; F2W(1,3)= d*cf;
-    F2W(2,0)=-d*cf; F2W(2,1)=-d*cf; F2W(2,2)= d*cf; F2W(2,3)= d*cf;
-    F2W(3,0)=-cd; F2W(3,1)= cd; F2W(3,2)=-cd; F2W(3,3)= cd;
-
-    // === ROS interfaces ===
-    auto qos = rclcpp::SystemDefaultsQoS();
-
-    desired_sub_ = this->create_subscription<
-      trajectory_msgs::msg::MultiDOFJointTrajectoryPoint>(
-        "desired_state", qos,
-        std::bind(&ControllerNode::onDesiredState, this, std::placeholders::_1));
-
-    current_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
-        "current_state", qos,
-        std::bind(&ControllerNode::onCurrentState, this, std::placeholders::_1));
-
-    motor_pub_ = this->create_publisher<mav_msgs::msg::Actuators>("rotor_speed_cmds", 10);
-
-    control_timer_ = this->create_wall_timer(
-      std::chrono::duration<double>(1.0/hz),
-      std::bind(&ControllerNode::controlLoop, this));
-
-    start_time_ = this->now();
-
-    RCLCPP_INFO(this->get_logger(),
-      "ControllerNode active | radius=%.2f alt=%.2f omega=%.2f",
-      circle_radius, circle_altitude, circle_omega);
+    RCLCPP_INFO(this->get_logger(), "Geometric hover controller initialized (z=30m).");
   }
 
 private:
-  // ROS entities
-  rclcpp::Subscription<trajectory_msgs::msg::MultiDOFJointTrajectoryPoint>::SharedPtr desired_sub_;
-  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr current_sub_;
+  // ROS
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   rclcpp::Publisher<mav_msgs::msg::Actuators>::SharedPtr motor_pub_;
-  rclcpp::TimerBase::SharedPtr control_timer_;
+  rclcpp::TimerBase::SharedPtr timer_;
 
-  // Controller params
-  double kx, kv, kr, komega;
-  double m,g,d,cf,cd;
-  Eigen::Matrix3d J;
-  Eigen::Vector3d e3;
-  Eigen::MatrixXd F2W;
+  // Params
+  double m_, g_, cf_, cd_, d_;
+  double kx_, kv_, kr_, komega_;
+  Eigen::Vector3d e3_;
 
   // States
-  Eigen::Vector3d x,v,omega;
-  Eigen::Matrix3d R;
+  Eigen::Vector3d x_, v_, omega_;
+  Eigen::Matrix3d R_;
 
-  // Desired states
-  Eigen:
+  // Desired
+  Eigen::Vector3d xd_, vd_, ad_;
+  double yawd_;
+
+  // Utils
+  static Eigen::Vector3d vee(const Eigen::Matrix3d &M) {
+    return Eigen::Vector3d(M(2,1), M(0,2), M(1,0));
+  }
+
+  void odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg) {
+    x_ << msg->pose.pose.position.x,
+          msg->pose.pose.position.y,
+          msg->pose.pose.position.z;
+    v_ << msg->twist.twist.linear.x,
+          msg->twist.twist.linear.y,
+          msg->twist.twist.linear.z;
+
+    Eigen::Quaterniond q(
+      msg->pose.pose.orientation.w,
+      msg->pose.pose.orientation.x,
+      msg->pose.pose.orientation.y,
+      msg->pose.pose.orientation.z);
+    R_ = q.toRotationMatrix();
+
+    Eigen::Vector3d w_world(
+      msg->twist.twist.angular.x,
+      msg->twist.twist.angular.y,
+      msg->twist.twist.angular.z);
+    omega_ = R_.transpose() * w_world;
+  }
+
+  void controlLoop() {
+    // === Position/velocity errors ===
+    Eigen::Vector3d ex = x_ - xd_;
+    Eigen::Vector3d ev = v_ - vd_;
+
+    // === Desired direction of body z-axis (b3d) ===
+    Eigen::Vector3d a_des = -kx_ * ex - kv_ * ev - g_ * e3_ + ad_;
+    Eigen::Vector3d b3d = a_des.normalized();
+
+    // === Desired yaw direction ===
+    Eigen::Vector3d b1d(std::cos(yawd_), std::sin(yawd_), 0);
+    Eigen::Vector3d b2d = b3d.cross(b1d).normalized();
+    Eigen::Vector3d b1_new = b2d.cross(b3d);
+    Eigen::Matrix3d Rd;
+    Rd << b1_new, b2d, b3d;
+
+    // === Orientation and angular velocity errors ===
+    Eigen::Matrix3d errM = 0.5 * (Rd.transpose() * R_ - R_.transpose() * Rd);
+    Eigen::Vector3d eR = vee(errM);
+    Eigen::Vector3d eOmega = omega_;
+
+    // === Control law ===
+    double f = m_ * a_des.dot(R_ * e3_);
+    Eigen::Vector3d M = -kr_ * eR - komega_ * eOmega;
+
+    // === Map desired wrench -> rotor thrusts ===
+    double ctf = cd_ / cf_;
+    Eigen::Matrix4d F2W;
+    F2W << 1, 1, 1, 1,
+           0, d_, 0, -d_,
+           -d_, 0, d_, 0,
+           -ctf, ctf, -ctf, ctf;
+
+    Eigen::Vector4d W;
+    W << f, M(0), M(1), M(2);
+    Eigen::Vector4d fi = F2W.inverse() * W;
+
+    // === Convert thrusts to angular velocities ===
+    mav_msgs::msg::Actuators cmd;
+    cmd.angular_velocities.resize(4);
+    for (int i = 0; i < 4; i++) {
+      double thrust = std::max(fi(i), 0.0);
+      double w = std::sqrt(thrust / cf_);
+      cmd.angular_velocities[i] = w;
+    }
+
+    motor_pub_->publish(cmd);
+  }
+};
+
+int main(int argc, char **argv) {
+  rclcpp::init(argc, argv);
+  rclcpp::spin(std::make_shared<GeoHoverController>());
+  rclcpp::shutdown();
+  return 0;
+}
