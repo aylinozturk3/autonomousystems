@@ -1,3 +1,4 @@
+//LASTVERSION
 #include <cmath>
 #include <memory>
 #include <string>
@@ -64,3 +65,4 @@ public:
     F2W.setZero();
     F2W(0,0)=cf; F2W(0,1)=cf; F2W(0,2)=cf; F2W(0,3)=cf;
     F2W(1,0)=
+
